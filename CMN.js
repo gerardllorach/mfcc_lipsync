@@ -18,7 +18,8 @@
   // var = false
   // veclen = 25
   // mfcc_dim = 12
-  // cweight = 
+// https://github.com/julius-speech/julius/blob/6d135a686a74376495a7a6f55d3d67df54186f83/man/julius.1
+  // cweight = 100 // default cmnmapweight
   // clist_max = CPSTEP
   // clist_num = 0;
   // clist = CMEAN object with CPSTEP elements {mfcc_sum, framenum}
@@ -102,7 +103,7 @@ CMN.prototype.update = function(){
     for (var j = 0; j< this.veclen; j++) 
       this.cmeanInit[j] += this.clist[i].mfcc_sum[j];
     if (this.clist[i] === undefined)
-      var aa = 0;//console.log("UNDEFINED", JSON.stringify(this.clist), i); 
+      console.error("UNDEFINED", JSON.stringify(this.clist), i); 
     else
     frames += this.clist[i].framenum;
     if (frames >= this.cpMax) break;
@@ -112,7 +113,7 @@ CMN.prototype.update = function(){
   
   
   this.cmeanInitSet = true;
-  return;
+  
   // expand clist if necessary
   if (this.clistNum == this.clistMax && frames < this.cpMax){
     this.clistMax += this.cpStep;
@@ -121,19 +122,18 @@ CMN.prototype.update = function(){
       this.clist[i].mfcc_sum = [];
       this.clist[i].framenum = 0;
     }
-    console.log("EXPAND", JSON.stringify(this.clist));
   }
   
   // shift clist
   var tmp = this.clist.splice(0, this.clistMax-1);
-  console.log ("TMP", JSON.stringify(tmp));
+  //console.log ("TMP", JSON.stringify(tmp));
   this.clist[0] = {mfcc_sum: [], framenum: 0};
   for (var i = 0; i < this.veclen; i++)
     this.clist[0].mfcc_sum[i] = this.mfcc_sum[i];
   
   this.clist[0].framenum = this.framenum;
   this.clist = this.clist.concat(tmp);
-  console.log ("CLIST", JSON.stringify(this.clist));
+  //console.log ("CLIST", JSON.stringify(this.clist));
   if (this.clistNum < this.clistMax)
     this.clistNum++;
 
