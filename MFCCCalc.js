@@ -12,11 +12,19 @@ function MFCC(analyser, opt){
   var opt = opt || {};
   
   this.analyser = analyser;
-  this.fs = 441000;
   
-  // MFCCs banks and results
+  // MFCCs banks
   this.filterBanks = [];
   this.filteredEnergies = [];
+  
+  // Pre-emphasis filter (freq domain)
+  this.h = [];
+  // DCT
+  this.dct = [];
+  // Cep lifter
+  this.cepWin = [];
+  
+  // MFCC results
   this.logFiltE = [];
   this.cepstralCoeff = [];
   this.mfcc = [];
@@ -27,19 +35,49 @@ function MFCC(analyser, opt){
   this.deltaCoeff = [];
   
   // MFCC parameters
-  this.numFilters = opt.numFilters || opt.fBankNum || 24; // Julius 24
+  this.numFilters = this.nFilt = opt.numFilters || opt.fBankNum || 24; // Julius 24
   this.mfccDim = opt.mfccDim || 12;
-  this.lowFreq = 0; // Julius disables hiPass and loPass, max-min freqs? Sampling rate?
-  this.highFreq = 8000; // mHi is 8000kHz in Julius
+  this.lowFreq = opt.lowFreq === undefined ? 0 : opt.lowFreq; // Julius disables hiPass and loPass, max-min freqs? Sampling rate?
+  this.highFreq = opt.highFreq || 8000; // mHi is 8000kHz in Julius
+  this.preEmph = opt.preEmph || 0.97;
 
-  this.fftSize = analyser.fftSize; // 512;
   this.lifter = opt.lifter || 22;
   this.deltaWin = opt.deltaWin || 2; // Delta window
   this.visualizationMFCC = opt.visualizationMFCC || 10;
-
+  
+  // Signal processing parameters
+  this.smpFreq = opt.smpFreq || 16000;
+  this.smpPeriod = opt.smpPeriod || 625;
+  this.frameSize = opt.frameSize || 400;
+  this.fShift = opt.fShift || 160;
 
   // CMN - Cepstral Mean Normalization
   this.cmn = null;
+  // CMN
+  this.cmn = new CMN (this.mfccDim);
+  
+  
+  
+  // LOGS
+  this.LOGMFCC = [];
+  this.LOGCSV = this.LOGFBE = "time";
+  for (var i = 0; i<this.mfccDim; i++)
+    this.LOGCSV += ", mfcc" + i;
+  for (var i = 0; i<this.numFilters; i++)
+    this.LOGFBE += ", bin" + i;
+  this.LOGCSV += "\n";
+  this.LOGFBE += "\n";
+  this.LOGMAG = "";
+  this.startTime = 0;
+  
+  this.mag = [];
+  this.fbe = [];
+  this.cc = [];
+  this.timestamp = [];
+  
+  
+  this.max = -1000000;
+  this.min = 1000000;
   
 }
 
@@ -47,9 +85,39 @@ function MFCC(analyser, opt){
 
 
 
-
 // Init
-MFCC.prototype.init = function(){
+MFCC.prototype.init = function(fs){
+  this.fs = fs || 44100;
+  
+  // Define fft size according to MFCC options
+  var fftSecs = this.frameSize / this.smpFreq;
+  var fftSamples = fftSecs * this.fs;
+  // Find closer fftSize that's power of two
+  var fftSize = 256;
+  
+  // fftSize has to be always bigger than fftSamples (Matlab)
+  var diff = fftSize - fftSamples;
+  while (diff < 0 && fftSize <= 32768){
+  	fftSize *= 2;
+    diff = fftSize - fftSamples;
+  }
+
+  
+  /*
+  var diff = Math.abs(fftSize - fftSamples);
+  for (var i = 0; i < 6; i++){
+    var nextFttSize = fftSize * 2;
+    var nextDiff = Math.abs(nextFttSize - fftSamples);
+    if ( nextDiff < diff){
+      diff = Math.abs(nextFttSize - fftSamples);
+      fftSize = nextFttSize;
+    } else
+			break;
+  }
+  */
+  this.analyser.fftSize = this.fftSize = fftSize;
+  
+  console.log("FFT size:", fftSize);
   
   // FFT buffer
   this.data = new Float32Array(this.analyser.frequencyBinCount);
@@ -60,6 +128,10 @@ MFCC.prototype.init = function(){
   
   // Create filter banks
   this.createFilterBanks();
+  // Create DCT matrix
+  this.createDCT();
+  // Create ceplifter
+  this.createLifter();
   
   // Previous coeff initialization
   for (var i = 0; i<(this.deltaWin*2+1) + this.visualizationMFCC; i++){
@@ -68,9 +140,6 @@ MFCC.prototype.init = function(){
       this.prevMFCC[i][j] = -1;
   }
 
-  // CMN
-  this.cmn = new CMN (this.mfccDim);
-  
 }
 
 
@@ -83,6 +152,7 @@ MFCC.prototype.computeMFCCs = function(){
   
   // Signal treatement (not done)
   // · Preemphasize -> wave[i] -= wave[i - 1] * preEmph;
+  // Preemphize done in frequency domain
   // · if "-ssload", load noise spectrum for spectral subtraction from file
   
   // FFT and wave data
@@ -99,7 +169,7 @@ MFCC.prototype.computeMFCCs = function(){
   var fs = this.fs;//context.sampleRate;
   var nFilt = this.filterBanks.length;// this.numFilters
 
-  // Calculate Log Raw Energy
+  // Calculate Log Raw Energy (before preemphasize and windowing in HTK default)
   var energy2 = 0;
   for (var i = 0; i<fftSize; i++)
     energy2 += this.wave[i] * this.wave[i];
@@ -118,11 +188,19 @@ MFCC.prototype.computeMFCCs = function(){
     filteredEnergies[i] = 0;
     for (var j = 0; j<nfft; j++){ // this.filterBanks[i].length = nfft
       var invLog = Math.pow(10, this.data[j]/20); // Remove last step (20*log10(data))
-      invLog *= fftSize; // Remove division
-      invLog = Math.sqrt(invLog * invLog); // Power
-      //invLog /= fftSize; // Take back division (in practial crypt. but not in julius code)
-      this.powerSpec[j] = invLog; // Power spectrum
+      invLog *= fftSize; // Remove division 1/N
+      invLog *= 1/1.0 // Matlab fft compensation
+      invLog = (Math.abs(invLog)); // Magnitude spectrum Matlab
+      invLog *= Math.pow(2,15);//? Similar values to Matlab? MAG
+      // Pre-emphasis filter
+      invLog *= this.h[j];
+      // Magnitude
+      this.powerSpec[j] = invLog;
       filteredEnergies[i] += this.filterBanks[i][j] *  invLog;
+      
+      if (this.max < invLog)this.max = invLog;
+      if (this.min > invLog) this.min = invLog;
+      
     }
 
     // Log
@@ -142,9 +220,9 @@ MFCC.prototype.computeMFCCs = function(){
     cepCoeff[i] = 0;
     for (var j = 0; j<nFilt; j++){ // fbank dim
       // Same as Julius
-      cepCoeff[i] += logFiltE[j] * Math.cos(i*Math.PI/nFilt * (j - 0.5));
+      cepCoeff[i] += logFiltE[j] * this.dct[i][j];//Math.cos(i*Math.PI/nFilt * (j - 0.5));
     }
-    cepCoeff[i] *= sqrt2var; // in Julius
+    //cepCoeff[i] *= sqrt2var; // in Julius
     
     //exception if i == 0? // Not in Julius? Why is this here?
     //cepCoeff[i] *= (i==0) ? 1/Math.sqrt(nFilt) : Math.sqrt(2/nFilt);
@@ -155,8 +233,7 @@ MFCC.prototype.computeMFCCs = function(){
   var mfcc = this.mfcc;
   // Weight cepstrums (Julius without MFCC_SINCOS_TABLE)
   for (var i = 0; i < mfccDim; i++){
-    var cepWin = 1.0 + lifter/2 * Math.sin((i+1) * Math.PI/lifter);
-    mfcc[i] = cepCoeff[i] * cepWin;
+    mfcc[i] = cepCoeff[i] * this.cepWin[i];
   }
   
   mfcc[mfccDim] = energy; // 13 numbers (12 mfcc + energy)
@@ -166,12 +243,61 @@ MFCC.prototype.computeMFCCs = function(){
   //}
   
   
+  
+  // Normalise log energy in HTK default
+  // if (para->energy && para->enormal)
+  // TODO, but only affects the energy parameter
+  
+  
+  
+  // Compute delta coefficients
   var deltaCoeff = this.deltaCoeff;
   var prevMFCC = this.prevMFCC;
   var divisor = 0;
   for (var n = 1; n <= this.deltaWin; n++) divisor += n * n;
   divisor *= 2;
+  
+  
+  // LOGS
+  if (this.LOGMFCC.length == 0)
+    this.startTime = LS.Globals.AContext.currentTime;
+  this.LOGMFCC.push({});
+  var lastInd = this.LOGMFCC.length-1;
+  var currentTime = LS.Globals.AContext.currentTime - this.startTime;
+  if (currentTime < 2.6525){ // HARDCODED
+    this.LOGMFCC[lastInd].time = currentTime;
+    this.LOGMFCC[lastInd].mfcc = [];
+    //this.LOGCSV += currentTime.toFixed(5);
+    //this.LOGFBE += currentTime.toFixed(5);
+    //this.LOGMAG += currentTime.toFixed(5);
+    
+    this.timestamp.push(currentTime);
+    this.mag.push([]);
+    this.fbe.push([]);
+    this.cc.push([]);
 
+    // CEPSTRAL COEFFICIENTS
+    for (var i = 0; i<mfccDim; i++){
+      this.cc[this.cc.length-1][i] = cepCoeff[i];
+      //this.LOGMFCC[lastInd].mfcc[i] = mfcc[i];
+      //this.LOGCSV += ", " + mfcc[i].toFixed(5);
+    }
+
+    // POWER SPECT
+    for (var i = 0; i<nfft; i++){
+      this.mag[this.mag.length-1][i] = this.powerSpec[i];
+    }
+    // FBE
+    for (var i = 0; i< nFilt; i++)
+      this.fbe[this.fbe.length-1][i] = filteredEnergies[i];
+    
+    this.LOGCSV += "\n";
+    this.LOGFBE += "\n";
+    this.LOGMAG += "\n";
+  } else{
+  	this.ended = true;
+  }
+    
   // Delta coefficients
   // Should compare the next and the past frame. As the next is not available in real-time,
   // the current mfcc is used.
@@ -186,6 +312,7 @@ MFCC.prototype.computeMFCCs = function(){
         prevMFCC[nextIdx][i] = mfcc[i];
       if (prevMFCC[pastIdx][i] == -1)
         prevMFCC[pastIdx][i] = mfcc[i];
+      
       
       // Compute delta coefficients
       // From the book it should be something like [b] [a] [current] [i] [j] -> (i-a) + (j-b)
@@ -233,53 +360,107 @@ MFCC.prototype.computeMFCCs = function(){
 
 
 // Create filter banks
-MFCC.prototype.freq2mfcc = function(f){return 1127 * Math.log(1+f/700);}
-MFCC.prototype.mfcc2freq = function(m){return 700*(Math.exp(m/1127) - 1);}
+MFCC.prototype.freq2mel = function(f){return 1127 * Math.log(1+f/700);}
+MFCC.prototype.mel2freq = function(m){return 700*(Math.exp(m/1127) - 1);}
 
-// TODO: instead of creating a filter for each bank, create just one side of the ramp /|/|/|/|...
-// TODO: optimize to highFreq, no need to go over all bins!
+
+
+// Create filter banks Matlab implementation
 MFCC.prototype.createFilterBanks = function(){
   
   // Half of the fft size
-  var nfft = this.analyser.frequencyBinCount;
+  var K = this.analyser.frequencyBinCount+1;
+  var fftSize = this.fftSize;
   // Sampling frequency
   var fs = this.fs;
   // Filters
-  var numFilters = this.numFilters;
+  var M = this.numFilters;
   var lowFreq = this.lowFreq;
   var highFreq = this.highFreq;
+  var fMin = 0;
+  var fMax = 0.5 * fs;
   
   
-  // Create mel and freq points
-  var mLF = this.freq2mfcc(lowFreq);
-  var mHF = this.freq2mfcc(highFreq);
-  var melPoints = [];
-  var freqBins = [];
-  for (var i = 0; i<numFilters+2; i++){
-    melPoints[i] = mLF + i*(mHF-mLF)/(numFilters+1); 
-    var hertzPoint = this.mfcc2freq(melPoints[i]);
-  	freqBins[i] = Math.floor(hertzPoint*nfft/(fs/2));
+  
+  // PRE EMPHASIS FILTER
+  // Create pre-emphasis filter
+  for (var i = 0; i < fftSize/2; i++){
+    var w = i/(fftSize/2) * Math.PI;
+    var real = 1 - this.preEmph*Math.cos(-w);
+    var img = -this.preEmph*Math.sin(-w);
+    this.h[i] = Math.sqrt(real*real + img*img);
   }
+  
+  
+  var f = [];
+  //var fw = [];
+  // Create mel and freq points
+  for (var i = 0; i<K; i++){
+    f[i] = fMin + i*(fMax - fMin)/K;
+    //fw[i] = this.freq2mel(f[i]);
+  }
+  
+  
+  // Create cutoff frequencies
+  var c = [];
+  //var cw = [];
+  var mLF = this.freq2mel(lowFreq);
+  var mHF = this.freq2mel(highFreq);
+  for (var i = 0; i<M+2; i++){
+  	c[i] = this.mel2freq(mLF + i*(mHF-mLF)/(M+1)); 
+  	//cw[i] = this.freq2mel(c[i]);
+  }
+  
 
   // Create filter banks
-  for (var i = 0; i < numFilters; i++){
-    this.filterBanks[i] = new Array(nfft);
+  for (var i = 0; i < M; i++){
+    this.filterBanks[i] = [];//new Array(K);
     // Create triangular filter
-    for (var j = 0; j < nfft; j++){
-      // Zero
-      if (j<=freqBins[i])
-        this.filterBanks[i][j] = 0;
-      // Ramp up
-      else if (j>=freqBins[i] && j<=freqBins[i+1])
-        this.filterBanks[i][j] = (j-freqBins[i])/(freqBins[i+1]- freqBins[i]);
-      // Ramp down
-      else if (j>freqBins[i+1] && j<=freqBins[i+2])
-        this.filterBanks[i][j] = (freqBins[i+2]-j)/(freqBins[i+2]- freqBins[i+1]);
-      // Zero
-      else if (j>freqBins[i+2])
-        this.filterBanks[i][j] = 0;
+    for (var j = 0; j < K; j++){
+      this.filterBanks[i][j] = 0;
+      // Up-slope
+      if (f[j]>=c[i] && f[j]<=c[i+1])
+      	this.filterBanks[i][j] = (f[j] - c[i])/(c[i+1] - c[i]);
+      // Down-slope
+      if (f[j]>=c[i+1] && f[j]<=c[i+2])
+        this.filterBanks[i][j] = (c[i+2]-f[j])/(c[i+2] - c[i+1]);
     }
     
   }
   
+  // LOG FILTERBANKS
+  this.LOGFB = "";
+  for (var i = 0; i< K; i++)
+  	this.LOGFB += "bin" + i + ", ";
+  for (var i = 0; i < M; i++){
+    this.LOGFB +="\n";
+    for (var j = 0; j < K; j++)
+      this.LOGFB += this.filterBanks[i][j] + ", ";
+  }
 }
+
+// DCT matrix
+MFCC.prototype.createDCT = function(){
+  var mfccDim = this.mfccDim;
+  var nFilt = this.nFilt;
+  // DCT of the coefficients
+  var sqrt2var = Math.sqrt(2/nFilt);
+  for (var i = 0; i<mfccDim; i++){
+    this.dct[i] = [];
+    for (var j = 0; j<nFilt; j++){
+      this.dct[i][j] = sqrt2var * Math.cos(i*Math.PI*((j+1)-0.5)/nFilt);
+    }
+  }
+}
+
+// Lifter coefficients
+MFCC.prototype.createLifter = function(){
+  var lifter = this.lifter;
+  var mfccDim = this.mfccDim;
+  // Weight cepstrums
+  for (var i = 0; i < mfccDim; i++){
+    this.cepWin[i] = 1.0 + lifter/2 * Math.sin(i * Math.PI/lifter);
+  }
+}
+
+
