@@ -1,6 +1,7 @@
-//@Model Reader
+//@Compute GMM
 
 // Reads phoneme model jnas-mono-16mix-gid.hmmdefs
+// Calculates GMM
 // Defines macros 
 // https://github.com/julius-speech/julius/blob/6d135a686a74376495a7a6f55d3d67df54186f83/libsent/include/sent/stddefs.h
 var LOG_ZERO = -1000000;
@@ -10,11 +11,18 @@ var INV_LOG_TEN = 0.434294482;
 var max = LOG_ZERO;
 var min = 0;
 
-function Model(URL){
+function Model(URL, mfccDim){
   
   this.model = {};
   this.prob = {};
   this.phonemeP = {};
+  // Several frames
+  this.probOverTime = {};
+  this.nFrame = 20; // 20 default if GMM_VAD - gmm_margin
+  // Compute several states?
+  this.nStates = 1;
+  // MFCC comparison dimension (default 25)
+  this.mfccDim = mfccDim || 12;
   
   this.ready = false;
   
@@ -23,20 +31,26 @@ function Model(URL){
   
   // Read GMM model
   this.read(URL);
-  
+    
 }
 
 // Calculate mixtures
 Model.prototype.compute = function(mfcc){
+  
+  
   
   this.maxProb = LOG_ZERO;
   this.minProb = 0;
   this.result = "";
   this.resultLow = "";
   
+
+  
   var phonemes = Object.keys(this.model);
   var prob = this.prob;
   var phonemeP = this.phonemeP;
+  
+  
   // gmm_proceed
   // outprob_state_nocache
   // gmm_calc_mix
@@ -49,13 +63,15 @@ Model.prototype.compute = function(mfcc){
     prob[ph] = [];
     phonemeP[ph] = {};
     var gmm_score = this.gmm_score = [];
-    // 3 States
-    for (var s = 0; s < 3; s++){
+    // 3 States? Only one in Julius? d->s[1]
+    // outprob_state_nocache(gc, mfcc->f, d->s[1], mfcc->param);
+    for (var s = 0; s < this.nStates; s++){
       gmm_score[s] = 0;
       for (var i = 0; i < phModel[s].length; i++){ // phModel[s].length = 16
         var g = phModel[s][i];
         var tmp = g.gconst;
-        for (var j = 0; j < mfcc.length; j++){ // mfcc.length = g.mean.length = 25
+        //for (var j = 0; j < mfcc.length; j++){ // mfcc.length = g.mean.length = 25
+        for (var j = 0; j < this.mfccDim; j++){ // No deltas! // *************** MODIFICATION!! Deltas are computed every 16ms, not as Julius
           var x = mfcc[j]-g.mean[j];
           tmp += x * x * g.variance[j];
   //-------------------------------------------------------
@@ -83,7 +99,7 @@ Model.prototype.compute = function(mfcc){
       var y = LOG_ZERO;
       var tmp = 0;
       // Add probabilities of the 16 gaussians
-      // In Julius, just the first 10
+      // In Julius, just the best first 10
       for (var i = 6; i < phModel[s].length; i++){
         // addlog_array -> a unique value for each of the 16 gaussians
         x = prob[ph][i];
@@ -111,7 +127,7 @@ Model.prototype.compute = function(mfcc){
       // outprob_state_nocache
       
       // gmm_proceed
-      gmm_score[s] += logsum; // if several frames computed?
+      gmm_score[s] = logsum;
       //phonemeP[ph]+=logsum;
       
     } // End FOR state
@@ -120,20 +136,24 @@ Model.prototype.compute = function(mfcc){
     // Find best of each state and compute confidence measure (CM)
     // gmm_end compute maxProb
     var tmpMax = LOG_ZERO;
-    for (s = 0; s <3; s++){
+    for (s = 0; s <this.nStates; s++){
       if (tmpMax < gmm_score[s]){
         phonemeP[ph].prob = gmm_score[s];
         tmpMax = gmm_score[s];
       }
     }
-    // Compute confidence measure (CM)
-    // gmm_proceed -> for several frames add scores
-    // gmm_end -> compute confidence measure
-    var sum = 0;
-    for (var s = 0; s < 3; s++)
-      sum += Math.pow(10, 0.05 * (gmm_score[s]-tmpMax));
 
-    phonemeP[ph].conf = sum;
+    // Several frames
+    // Shift
+    this.probOverTime[ph].shift();
+    // Store new prob (last item)
+    this.probOverTime[ph][this.nFrame-1] = tmpMax;
+
+    
+    // Compute addition
+    phonemeP[ph].prob = 0;
+    for (var i = 0; i< this.nFrame; i++)
+    	phonemeP[ph].prob+=this.probOverTime[ph][i];
     
     
     if (phonemeP[ph].prob > this.maxProb){
@@ -145,7 +165,19 @@ Model.prototype.compute = function(mfcc){
       this.resultLow = ph;
     }
     
+  } // End for phonemes
+  
+  // Compute confidence measure (CM)
+  // gmm_proceed -> for several frames add scores
+  // gmm_end -> compute confidence measure
+  var sum = 0;
+  for (var p = 0; p < phonemes.length; p++){
+    var ph = phonemes[p]; // key name
+    sum += Math.pow(10, 0.05 * (phonemeP[ph].prob-this.maxProb));
   }
+  
+  this.confidence = 1/sum;
+  //phonemeP[ph].conf = sum;
   
   
   //console.log("PHONEME:", this.result, ", CM:", sum);
@@ -176,21 +208,21 @@ Model.prototype.makeLogTbl = function(){
 Model.prototype.read = function(url){
   
   var that = this;
-  var req = new XMLHttpRequest();
-  
-  req.open('GET', url, true);
+	var req = new XMLHttpRequest();
+	
+	req.open('GET', url, true);
   
   req.onload = function()
-  {
-    var response = this.response;
-    if(this.status < 200 || this.status >= 300)
-      return console.error("File not found: ", this.status);
+	{
+		var response = this.response;
+		if(this.status < 200 || this.status >= 300)
+			return console.error("File not found: ", this.status);
     
     console.log("Finised loading.");
-    that.ready = that.parse(this.response);
-    
-    return;
-  }
+		that.ready = that.parse(this.response);
+		
+		return;
+	}
   
   req.addEventListener("progress", function(e){
     var progress = e.loaded/e.total;
@@ -219,8 +251,8 @@ Model.prototype.parse = function(data){
     // Each letter has 3 states. Each state has 16 GMM (mixture, mean, variance). 48 GMM in total.
     var phonemeContent = tmp[2];
    
-    // 3 states
-    var states = phonemeContent.split("<STATE>");
+		// 3 states
+		var states = phonemeContent.split("<STATE>");
     states.shift();
     
     for (var s = 0; s < 3; s++){
@@ -255,10 +287,21 @@ Model.prototype.parse = function(data){
     }
     
   }
+  
+  // Prepare previous probabilities array
+  var phonemes = Object.keys(this.model);
+  // Use several frames to compute probs (init) TODOOOOOO
+  for (var p = 0; p < phonemes.length; p++){
+    var ph = phonemes[p]; // key name
+    this.probOverTime[ph] = [];
+    for (var i = 0; i<this.nFrame; i++)
+      this.probOverTime[ph][i] = LOG_ZERO;
+  }
+
 
   console.log("Finised parsing.");//, this.model);
   return true;
-  //console.log(this.model);
+	//console.log(this.model);
 
 
 }

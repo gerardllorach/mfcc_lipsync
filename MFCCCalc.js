@@ -59,20 +59,10 @@ function MFCC(analyser, opt){
   
   
   // LOGS
-  this.LOGMFCC = [];
-  this.LOGCSV = this.LOGFBE = "time";
-  for (var i = 0; i<this.mfccDim; i++)
-    this.LOGCSV += ", mfcc" + i;
-  for (var i = 0; i<this.numFilters; i++)
-    this.LOGFBE += ", bin" + i;
-  this.LOGCSV += "\n";
-  this.LOGFBE += "\n";
-  this.LOGMAG = "";
-  this.startTime = 0;
-  
   this.mag = [];
   this.fbe = [];
   this.cc = [];
+  this.mfccLog = [];
   this.timestamp = [];
   
   
@@ -102,19 +92,6 @@ MFCC.prototype.init = function(fs){
     diff = fftSize - fftSamples;
   }
 
-  
-  /*
-  var diff = Math.abs(fftSize - fftSamples);
-  for (var i = 0; i < 6; i++){
-    var nextFttSize = fftSize * 2;
-    var nextDiff = Math.abs(nextFttSize - fftSamples);
-    if ( nextDiff < diff){
-      diff = Math.abs(nextFttSize - fftSamples);
-      fftSize = nextFttSize;
-    } else
-			break;
-  }
-  */
   this.analyser.fftSize = this.fftSize = fftSize;
   
   console.log("FFT size:", fftSize);
@@ -189,9 +166,9 @@ MFCC.prototype.computeMFCCs = function(){
     for (var j = 0; j<nfft; j++){ // this.filterBanks[i].length = nfft
       var invLog = Math.pow(10, this.data[j]/20); // Remove last step (20*log10(data))
       invLog *= fftSize; // Remove division 1/N
-      invLog *= 1/1.0 // Matlab fft compensation
+      invLog *= 1/1.0 // Matlab fft compensation? 1/1.5?
       invLog = (Math.abs(invLog)); // Magnitude spectrum Matlab
-      invLog *= Math.pow(2,15);//? Similar values to Matlab? MAG
+      //invLog *= Math.pow(2,15);//? Similar values to Matlab? MAG
       // Pre-emphasis filter
       invLog *= this.h[j];
       // Magnitude
@@ -207,8 +184,6 @@ MFCC.prototype.computeMFCCs = function(){
     if (filteredEnergies[i]<1 ) filteredEnergies[i] = 1;
     logFiltE[i] = Math.log(filteredEnergies[i]);
     
-    //if (filteredEnergies[i]>1)
-    //  console.log(i, filteredEnergies[i].toFixed(3), logFiltE[i].toFixed(3));
   }
 
 
@@ -219,24 +194,22 @@ MFCC.prototype.computeMFCCs = function(){
   for (var i = 0; i<mfccDim; i++){
     cepCoeff[i] = 0;
     for (var j = 0; j<nFilt; j++){ // fbank dim
-      // Same as Julius
-      cepCoeff[i] += logFiltE[j] * this.dct[i][j];//Math.cos(i*Math.PI/nFilt * (j - 0.5));
+      cepCoeff[i] += logFiltE[j] * this.dct[i][j];
     }
-    //cepCoeff[i] *= sqrt2var; // in Julius
-    
-    //exception if i == 0? // Not in Julius? Why is this here?
-    //cepCoeff[i] *= (i==0) ? 1/Math.sqrt(nFilt) : Math.sqrt(2/nFilt);
   }
   
   
   var lifter = this.lifter;
   var mfcc = this.mfcc;
-  // Weight cepstrums (Julius without MFCC_SINCOS_TABLE)
+  // Weight cepstrums
   for (var i = 0; i < mfccDim; i++){
     mfcc[i] = cepCoeff[i] * this.cepWin[i];
   }
   
   mfcc[mfccDim] = energy; // 13 numbers (12 mfcc + energy)
+  
+  
+  
   //if (max > mfcc[mfccDim]){
   //  max = mfcc[mfccDim];
   //  console.log("MIN_ENERGY", mfcc[mfccDim]);
@@ -259,28 +232,23 @@ MFCC.prototype.computeMFCCs = function(){
   
   
   // LOGS
-  if (this.LOGMFCC.length == 0)
+  if (!this.startTime)
     this.startTime = LS.Globals.AContext.currentTime;
-  this.LOGMFCC.push({});
-  var lastInd = this.LOGMFCC.length-1;
+
   var currentTime = LS.Globals.AContext.currentTime - this.startTime;
   if (currentTime < 2.6525){ // HARDCODED
-    this.LOGMFCC[lastInd].time = currentTime;
-    this.LOGMFCC[lastInd].mfcc = [];
-    //this.LOGCSV += currentTime.toFixed(5);
-    //this.LOGFBE += currentTime.toFixed(5);
-    //this.LOGMAG += currentTime.toFixed(5);
     
     this.timestamp.push(currentTime);
     this.mag.push([]);
     this.fbe.push([]);
     this.cc.push([]);
+    this.mfccLog.push([]);
 
     // CEPSTRAL COEFFICIENTS
+    // MFCC COEFFICIENTS
     for (var i = 0; i<mfccDim; i++){
       this.cc[this.cc.length-1][i] = cepCoeff[i];
-      //this.LOGMFCC[lastInd].mfcc[i] = mfcc[i];
-      //this.LOGCSV += ", " + mfcc[i].toFixed(5);
+      this.mfccLog[this.mfccLog.length-1][i] = mfcc[i];
     }
 
     // POWER SPECT
@@ -291,9 +259,6 @@ MFCC.prototype.computeMFCCs = function(){
     for (var i = 0; i< nFilt; i++)
       this.fbe[this.fbe.length-1][i] = filteredEnergies[i];
     
-    this.LOGCSV += "\n";
-    this.LOGFBE += "\n";
-    this.LOGMAG += "\n";
   } else{
   	this.ended = true;
   }
@@ -352,6 +317,7 @@ MFCC.prototype.computeMFCCs = function(){
   mfcc = this.cmn.realtime(mfcc);
   // Update
   this.cmn.update();
+  
   
 }
 
